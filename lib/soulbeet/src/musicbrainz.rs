@@ -1,14 +1,13 @@
 use musicbrainz_rs::{
-    entity::{
+    Fetch, MusicBrainzClient, Search, entity::{
         artist_credit::ArtistCredit,
         recording::{Recording, RecordingSearchQuery},
-        release::{Release, ReleaseStatus},
-        release_group::{ReleaseGroup, ReleaseGroupPrimaryType, ReleaseGroupSearchQuery},
-    },
-    Fetch, MusicBrainzClient, Search,
+        release::{Release, ReleaseSearchQuery},
+        release_group::ReleaseGroupPrimaryType,
+    }
 };
 use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
-use std::{collections::HashSet, future::Future, sync::OnceLock, time::Duration};
+use std::{collections::{HashMap, HashSet}, future::Future, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -264,55 +263,66 @@ pub async fn search(
         }
         SearchType::Album => {
             let search_results = with_retry("MusicBrainz album search", || {
-                let mut album_query = ReleaseGroupSearchQuery::query_builder();
+                let mut album_query = ReleaseSearchQuery::query_builder();
                 if let Some(ref artist) = artist {
                     album_query.artist(artist).and();
                 }
-                let search_query = album_query.release_group(query).build();
+                let search_query = album_query.release(query).and().status("Official").build();
+                let limit = 100; // lower numbers (like 25) might not yield everything
                 async move {
-                    ReleaseGroup::search(search_query)
+                    Release::search(search_query)
                         .limit(limit)
-                        .with_releases()
                         .with_ratings()
+                        .with_release_groups()
                         .execute_with_client(client)
                         .await
                 }
             })
             .await?;
 
+            // TODO does not work as of know, release_group is not populated with ratings, when searching for releases
             // Sort by rating (descending) - higher rated albums first
-            let mut release_groups: Vec<_> = search_results.entities;
-            release_groups.sort_by(|a, b| {
-                let a_rating = a.rating.as_ref().and_then(|r| r.value).unwrap_or(0.0);
-                let b_rating = b.rating.as_ref().and_then(|r| r.value).unwrap_or(0.0);
+            let mut releases: Vec<_> = search_results.entities;
+            releases.sort_by(|a, b| {
+                let a_rating = a.release_group.as_ref().unwrap().rating.as_ref().and_then(|r| r.value).unwrap_or(0.0);
+                let b_rating = b.release_group.as_ref().unwrap().rating.as_ref().and_then(|r| r.value).unwrap_or(0.0);
                 b_rating.partial_cmp(&a_rating).unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            for release_group in release_groups {
-                if release_group.primary_type != Some(ReleaseGroupPrimaryType::Album)
-                    && release_group.primary_type != Some(ReleaseGroupPrimaryType::Ep)
+            // TODO if there are "duplicate" releases (according to our metric), we might pick one without a cover (fallback to release_group cover?)
+            // artist -> unique releases
+            let mut unique_releases: HashMap<String, HashSet<String>> = HashMap::new();
+            for release in releases {
+                if release.release_group.as_ref().unwrap().primary_type != Some(ReleaseGroupPrimaryType::Album)
+                    && release.release_group.as_ref().unwrap().primary_type != Some(ReleaseGroupPrimaryType::Ep)
                 {
                     continue;
                 }
 
-                if let Some(best_release) = release_group.releases.as_ref().and_then(|releases| {
-                    releases
-                        .iter()
-                        .filter(|r| r.status == Some(ReleaseStatus::Official))
-                        .min_by_key(|release| release.date.as_ref().map(|d| &d.0))
-                }) {
-                    // If no official release was found, take the first one available
-                    let final_release = best_release.clone();
+                let title = match release.disambiguation.as_deref() {
+                    None | Some("") => release.title.clone(),
+                    Some(disambiguation) => format!("{} ({})", release.title.clone(), disambiguation),
+                };
 
-                    results.push(SearchResult::Album(Album {
-                        id: final_release.id.clone(),
-                        title: release_group.title.clone(),
-                        artist: format_artist_credit(&release_group.artist_credit),
-                        release_date: final_release.date.as_ref().map(|d| d.0.clone()),
-                        mbid: Some(final_release.id.clone()),
-                        cover_url: None,
-                    }));
+                let artist = release
+                    .artist_credit
+                    .as_ref()
+                    .map_or("Unknown".into(), |ac| {
+                        ac.first().map_or("Unknown".into(), |a| a.name.clone())
+                    });
+                let artist_releases_set = unique_releases.entry(artist).or_default();
+                if !artist_releases_set.insert(title.clone()) {
+                    continue;
                 }
+
+                results.push(SearchResult::Album(Album {
+                    id: release.id.clone(),
+                    title,
+                    artist: format_artist_credit(&release.artist_credit),
+                    release_date: release.date.as_ref().map(|d| d.0.clone()),
+                    mbid: Some(release.id.clone()),
+                    cover_url: None,
+                }));
             }
         }
     }
