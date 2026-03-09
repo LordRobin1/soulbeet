@@ -7,7 +7,7 @@ use musicbrainz_rs::{
     }
 };
 use shared::metadata::{Album, AlbumWithTracks, SearchResult, Track};
-use std::{collections::{HashMap, HashSet}, future::Future, sync::OnceLock, time::Duration};
+use std::{cmp, collections::{HashMap, HashSet}, future::Future, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -292,6 +292,10 @@ pub async fn search(
             // TODO if there are "duplicate" releases (according to our metric), we might pick one without a cover (fallback to release_group cover?)
             // artist -> unique releases
             let mut unique_releases: HashMap<String, HashSet<String>> = HashMap::new();
+            // track when artists first appeared in response
+            // used to sort the final result vec
+            let mut artist_order: HashMap<String, usize> = HashMap::new();
+
             for release in releases {
                 if release.release_group.as_ref().unwrap().primary_type != Some(ReleaseGroupPrimaryType::Album)
                     && release.release_group.as_ref().unwrap().primary_type != Some(ReleaseGroupPrimaryType::Ep)
@@ -304,12 +308,10 @@ pub async fn search(
                     Some(disambiguation) => format!("{} ({})", release.title.clone(), disambiguation),
                 };
 
-                let artist = release
-                    .artist_credit
-                    .as_ref()
-                    .map_or("Unknown".into(), |ac| {
-                        ac.first().map_or("Unknown".into(), |a| a.name.clone())
-                    });
+                let artist = format_artist_credit(&release.artist_credit);
+                if !artist_order.contains_key(&artist) {
+                    artist_order.insert(artist.clone(), artist_order.len());
+                }
                 let artist_releases_set = unique_releases.entry(artist).or_default();
                 if !artist_releases_set.insert(title.clone()) {
                     continue;
@@ -324,6 +326,22 @@ pub async fn search(
                     cover_url: None,
                 }));
             }
+
+            results.sort_by(|a, b| {
+                let SearchResult::Album(a_album) = a else { return cmp::Ordering::Equal; };
+                let SearchResult::Album(b_album) = b else { return cmp::Ordering::Equal; };
+                let a_artist_rank = artist_order.get(&a_album.artist).unwrap_or(&usize::MAX);
+                let b_artist_rank = artist_order.get(&b_album.artist).unwrap_or(&usize::MAX);
+                let is_missing = |date: &Option<String>| {
+                    date.as_deref().unwrap_or("").is_empty()
+                };
+                // First sort by artist rank (i.e. when they appeared in the musicbrainz response)
+                a_artist_rank.cmp(&b_artist_rank)
+                    // Then push releases without release date to the back
+                    .then(is_missing(&a_album.release_date).cmp(&is_missing(&b_album.release_date)))
+                    // Then sort by release date
+                    .then(a_album.release_date.cmp(&b_album.release_date))
+            });
         }
     }
 
